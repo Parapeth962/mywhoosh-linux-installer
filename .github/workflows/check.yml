@@ -1,0 +1,12 @@
+name: Check
+on:
+  push:
+  pull_request:
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n install.sh && bash -n mywhoosh.sh
+      - run: shellcheck -S warning install.sh mywhoosh.sh
+      - run: python3 -m py_compile ble-bridge.py

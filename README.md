@@ -89,8 +89,9 @@ Everything goes to `~/Games/mywhoosh-linux` (HD: `~/Games/mywhoosh-hd-linux`); P
 ~/Games/mywhoosh-linux/bin/mywhoosh.sh uninstall     # remove it all
 ```
 
-`MYWHOOSH_NO_UPDATE=1` skips the update check for one start. Every start leaves a log in
-`~/Games/mywhoosh-linux/logs/`; attach the newest one to a bug report.
+`MYWHOOSH_NO_UPDATE=1` skips the update check for one start. `MYWHOOSH_NO_DISPLAY_UNSCALE=1`
+disables the temporary 1:1 display scale switch on GNOME Wayland fractional scaling. Every start
+leaves a log in `~/Games/mywhoosh-linux/logs/`; attach the newest one to a bug report.
 
 ## Troubleshooting
 

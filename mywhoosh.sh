@@ -120,6 +120,176 @@ stop_stale() {
     fi
 }
 
+# --- GNOME fractional scaling / Moonlight KMS capture fix --------------------
+# With GNOME fractional scaling on (e.g. 133%) and Fedora's default
+# xwayland-native-scaling + scale-monitor-framebuffer, Xwayland reports a 2x
+# logical size (meta_xwayland_get_effective_scale() returns ceil(scale)). The game
+# launches borderless-fullscreen at that oversized size (e.g. 2880x1620 on a
+# 1080p panel); Mutter Direct-Scanouts the oversized framebuffer (the GPU
+# downscales it for the physical monitor, so the local screen looks fine), but a
+# KMS screen capture (Sunshine/Moonlight) grabs the CRTC at the native mode and
+# copies only the top-left native-sized region -- a cropped quarter on the stream.
+# Dropping the single active monitor to 1:1 for the session fixes it (integer
+# HiDPI scales like 2.0 already report native resolution and are left alone).
+# Applied via org.gnome.Mutter.DisplayConfig with method=1 (temporary), so
+# monitors.xml is never modified and color-mode / rgb-range / underscanning are
+# preserved. Opt out with MYWHOOSH_NO_DISPLAY_UNSCALE=1.
+ensure_session_bus() {
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "/run/user/$(id -u)/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+    fi
+}
+
+# Clamp the game's saved resolution to the monitor's native size so a stale
+# oversized value can't reintroduce the oversized framebuffer.
+clamp_game_resolution() {
+    local max_w="$1" max_h="$2"
+    local ini="$PFX/drive_c/users/steamuser/AppData/Local/MyWhoosh/Saved/Config/Windows/GameUserSettings.ini"
+    [[ -f "$ini" && "$max_w" -gt 0 && "$max_h" -gt 0 ]] || return 0
+    python3 - "$ini" "$max_w" "$max_h" <<'EOF' || true
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+mw, mh = int(sys.argv[2]), int(sys.argv[3])
+txt = p.read_text(encoding="utf-8", errors="replace")
+w_keys = {"ResolutionSizeX", "LastUserConfirmedResolutionSizeX",
+          "DesiredScreenWidth", "LastUserConfirmedDesiredScreenWidth"}
+h_keys = {"ResolutionSizeY", "LastUserConfirmedResolutionSizeY",
+          "DesiredScreenHeight", "LastUserConfirmedDesiredScreenHeight"}
+changed = False
+out = []
+for line in txt.splitlines(keepends=True):
+    m = re.match(r"^([A-Za-z0-9_]+)=(\d+)(\r?\n?)$", line)
+    if m:
+        k, v, eol = m.group(1), int(m.group(2)), m.group(3)
+        if k in w_keys and v > mw:
+            line = f"{k}={mw}{eol}"; changed = True
+        elif k in h_keys and v > mh:
+            line = f"{k}={mh}{eol}"; changed = True
+    out.append(line)
+if changed:
+    p.write_text("".join(out), encoding="utf-8")
+EOF
+}
+
+# Globals (not local) so the EXIT/signal trap can see them after cmd_run returns.
+display_connector=""
+display_scale=""
+
+# Apply a temporary (method=1) scale change via org.gnome.Mutter.DisplayConfig.
+# Modes:
+#   unscale                if single Wayland monitor has a fractional scale, set 1.0
+#   restore <conn> <scale> if same single monitor is still at ~1.0, restore <scale>
+mutter_display_scale() {
+    ensure_session_bus
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || return 0
+    python3 - "$@" <<'EOF' 2>/dev/null || true
+import sys
+from gi.repository import Gio, GLib
+
+action = sys.argv[1]
+proxy = Gio.DBusProxy.new_for_bus_sync(
+    Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
+    "org.gnome.Mutter.DisplayConfig",
+    "/org/gnome/Mutter/DisplayConfig",
+    "org.gnome.Mutter.DisplayConfig", None,
+)
+serial, monitors, logical_monitors, props = proxy.call_sync(
+    "GetCurrentState", None, Gio.DBusCallFlags.NO_AUTO_START, -1, None
+).unpack()
+
+# Only Wayland logical layout mode (1) uses fractional overscaling.
+if props.get("layout-mode", 1) != 1 or len(logical_monitors) != 1:
+    raise SystemExit(0)
+
+x, y, scale, transform, primary, lm_mons, _ = logical_monitors[0]
+if len(lm_mons) != 1:
+    raise SystemExit(0)
+
+conn = str(lm_mons[0][0])
+mode_id, mw, mh, supported_scales, mprops = "", 0, 0, [], {}
+for spec, modes, mp in monitors:
+    if str(spec[0]) == conn:
+        mprops = mp
+        for m in modes:
+            if m[6].get("is-current"):
+                mode_id, mw, mh, supported_scales = str(m[0]), int(m[1]), int(m[2]), list(m[5])
+                break
+        break
+if not mode_id:
+    raise SystemExit(0)
+
+# Transforms 1, 3, 5, 7 are 90/270-degree rotations (swap native width/height).
+if int(transform) & 1:
+    mw, mh = mh, mw
+
+def apply_scale(target):
+    closest = min(supported_scales, key=lambda s: abs(s - target), default=None)
+    if closest is None or abs(closest - target) > 0.01:
+        return False
+    mon_opts = {}
+    if mprops.get("is-underscanning"):
+        mon_opts["underscanning"] = GLib.Variant("b", True)
+    if "color-mode" in mprops:
+        mon_opts["color-mode"] = GLib.Variant("u", int(mprops["color-mode"]))
+    if "rgb-range" in mprops:
+        mon_opts["rgb-range"] = GLib.Variant("u", int(mprops["rgb-range"]))
+    cfg_props = {}
+    if props.get("supports-changing-layout-mode") and "layout-mode" in props:
+        cfg_props["layout-mode"] = GLib.Variant("u", int(props["layout-mode"]))
+    leased = [spec for spec, _, mp in monitors if mp.get("is-for-lease")]
+    if leased:
+        cfg_props["monitors-for-lease"] = GLib.Variant("a(ssss)", leased)
+    params = GLib.Variant(
+        "(uua(iiduba(ssa{sv}))a{sv})",
+        (int(serial), 1, [(int(x), int(y), float(closest), int(transform), bool(primary),
+                           [(conn, mode_id, mon_opts)])], cfg_props),
+    )
+    proxy.call_sync("ApplyMonitorsConfig", params, Gio.DBusCallFlags.NO_AUTO_START, -1, None)
+    return True
+
+if action == "unscale":
+    changed = 0
+    # Only fractional scales overscale Xwayland; integer scales (1.0, 2.0, ...) are already native.
+    if abs(float(scale) - round(float(scale))) > 0.01:
+        if apply_scale(1.0):
+            changed = 1
+    print(f"{conn}|{float(scale)}|{mw}|{mh}|{changed}")
+elif action == "restore":
+    expect_conn, target_scale = sys.argv[2], float(sys.argv[3])
+    if conn == expect_conn and abs(float(scale) - 1.0) <= 0.01:
+        if apply_scale(target_scale):
+            print("restored")
+EOF
+}
+
+setup_native_display_scale() {
+    [[ "${MYWHOOSH_NO_DISPLAY_UNSCALE:-0}" != 1 ]] || return 0
+    [[ "${XDG_SESSION_TYPE:-}" != x11 ]] || return 0
+    local info
+    info="$(mutter_display_scale unscale)"
+    [[ -n "$info" ]] || return 0
+    local conn scale mw mh changed
+    IFS='|' read -r conn scale mw mh changed <<<"$info"
+    if [[ "$changed" == 1 && -n "$conn" && -n "$scale" ]]; then
+        display_connector="$conn"
+        display_scale="$scale"
+        say "temporarily set $conn to 1:1 scale (was $scale; restored on exit)"
+        sleep 0.2
+    fi
+    clamp_game_resolution "${mw:-0}" "${mh:-0}"
+}
+
+restore_display_scale() {
+    if [[ -n "${display_connector:-}" && -n "${display_scale:-}" ]]; then
+        local conn="$display_connector" scale="$display_scale"
+        display_connector=""
+        display_scale=""
+        if [[ "$(mutter_display_scale restore "$conn" "$scale")" == restored ]]; then
+            say "restored $conn scale to $scale"
+        fi
+    fi
+}
+
 install_proton() {
     [[ -x "$PROTON_DIR/proton" ]] && { say "Proton $PROTON_NAME already installed"; return; }
     local tarball="$CACHE/$PROTON_NAME-x86_64.tar.gz"
@@ -364,7 +534,11 @@ cmd_run() {
     fi
     local bridge=$!
     local status=0
+    trap restore_display_scale EXIT INT TERM HUP
+    setup_native_display_scale
     (cd "$(dirname "$EXE")" && "$UMU" "$EXE") >>"$log" 2>&1 || status=$?
+    trap - EXIT INT TERM HUP
+    restore_display_scale
     kill "$bridge" 2>/dev/null || true
     echo "exit status $status" >>"$log"
     say "$TITLE exited with status $status"
